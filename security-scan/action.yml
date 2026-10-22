@@ -1,0 +1,59 @@
+name: QORE security scan
+description: Scan this repository with QORE (SAST, SCA, secrets) and fail the build on new findings.
+author: Be4Breach
+
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  api-key:
+    description: QORE CI/CD API key (be4ci_...). Create it in QORE under Settings, API Keys, and store it as a repository secret.
+    required: true
+  api-url:
+    description: Base URL of your QORE API. Only needed for self-hosted installations.
+    required: false
+    default: https://api.be4breach.com
+  repo:
+    description: owner/name of the repository to scan. Defaults to the repository the workflow runs in.
+    required: false
+    default: ${{ github.repository }}
+  fail-on:
+    description: Comma list of critical, high, medium, low, kev. The build fails when a matching finding is found.
+    required: false
+    default: critical,kev
+  mode:
+    description: "new = fail only on findings first seen in this scan; all = fail on every open finding."
+    required: false
+    default: new
+  timeout-minutes:
+    description: How long to wait for the scan.
+    required: false
+    default: "20"
+
+outputs:
+  verdict:
+    description: pass, fail or error
+    value: ${{ steps.scan.outputs.verdict }}
+  scan-id:
+    description: The QORE scan id
+    value: ${{ steps.scan.outputs.scan_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        QORE_API_KEY: ${{ inputs.api-key }}
+        QORE_API_URL: ${{ inputs.api-url }}
+        QORE_REPO: ${{ inputs.repo }}
+        QORE_FAIL_ON: ${{ inputs.fail-on }}
+        QORE_MODE: ${{ inputs.mode }}
+        QORE_TIMEOUT: ${{ inputs.timeout-minutes }}
+      run: |
+        python3 "${{ github.action_path }}/qore_scan.py" \
+          --repo "$QORE_REPO" \
+          --fail-on "$QORE_FAIL_ON" \
+          --mode "$QORE_MODE" \
+          --timeout-minutes "$QORE_TIMEOUT"
