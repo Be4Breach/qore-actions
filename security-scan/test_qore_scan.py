@@ -192,3 +192,73 @@ def test_there_is_no_connector_option_any_more(monkeypatch):
     monkeypatch.setenv("QORE_API_KEY", KEY)
     with pytest.raises(SystemExit):
         qore_scan.parse_args(["--repo", "acme/api", "--connector-id", "x"])
+
+
+# ── network hiccups while waiting must not fail a scan that is still running ─────
+
+def _scripted_request(monkeypatch, steps):
+    """Replace _request with scripted answers: an exception instance is raised, anything else is returned."""
+    calls = []
+
+    def fake(method, url, key, body=None, timeout=30):
+        calls.append(method)
+        step = steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    monkeypatch.setattr(qore_scan, "_request", fake)
+    return calls
+
+
+def _net_error():
+    return qore_scan.NetworkError("Could not reach the QORE API: TimeoutError")
+
+
+def test_polling_survives_transient_network_errors(monkeypatch):
+    _scripted_request(monkeypatch, [_net_error(), _net_error(), (200, DONE_PASS, {})])
+    sleeps = []
+    result = qore_scan.wait_for_verdict("https://x.example", KEY, "abc123", "critical,kev", "new", 1200, 10, sleep=sleeps.append)
+    assert result["verdict"] == "pass" and len(sleeps) == 2 and sleeps[1] > sleeps[0] >= 10  # backs off
+
+
+def test_a_timeout_during_polling_does_not_fail_the_build_end_to_end(monkeypatch):
+    monkeypatch.setenv("QORE_API_KEY", KEY)
+    calls = _scripted_request(monkeypatch, [
+        (202, {"scan_id": "abc123", "repo": "acme/api", "run_number": 2}, {}),   # the scan starts
+        (200, {"done": False, "status": "running"}, {}),
+        _net_error(),                                                             # one poll times out
+        (200, DONE_PASS, {}),                                                      # the next one answers
+    ])
+    code = qore_scan.main(["--repo", "acme/api", "--api-url", "https://x.example", "--poll-seconds", "2"], sleep=lambda s: None)
+    assert code == qore_scan.EXIT_PASS and calls == ["POST", "GET", "GET", "GET"]
+
+
+def test_a_long_silence_ends_the_wait_with_a_clear_error(monkeypatch):
+    _scripted_request(monkeypatch, [_net_error()] * 50)
+    ticks = iter(range(0, 100_000, 40))  # fake clock: 40 s per reading
+    with pytest.raises(qore_scan.QoreError, match="Lost contact"):
+        qore_scan.wait_for_verdict("https://x.example", KEY, "abc123", "critical", "new", 7200, 10,
+                                   sleep=lambda s: None, clock=lambda: next(ticks), max_silence_s=300)
+
+
+def test_network_errors_still_respect_the_overall_timeout(monkeypatch):
+    _scripted_request(monkeypatch, [_net_error()] * 50)
+    ticks = iter(range(0, 100_000, 30))
+    with pytest.raises(qore_scan.QoreError, match="Timed out"):
+        qore_scan.wait_for_verdict("https://x.example", KEY, "abc123", "critical", "new", 90, 10,
+                                   sleep=lambda s: None, clock=lambda: next(ticks), max_silence_s=100_000)
+
+
+def test_starting_a_scan_is_not_retried_on_a_network_error(monkeypatch):
+    # a POST that timed out may still have started the scan, so retrying could start a second one
+    calls = _scripted_request(monkeypatch, [_net_error(), (202, {"scan_id": "x"}, {})])
+    with pytest.raises(qore_scan.NetworkError):
+        qore_scan.start_scan("https://x.example", KEY, "acme/api")
+    assert calls == ["POST"]
+
+
+def test_a_rejected_key_while_polling_is_still_fatal(monkeypatch):
+    _scripted_request(monkeypatch, [_net_error(), (401, {}, {})])
+    with pytest.raises(qore_scan.QoreError, match="rejected"):
+        qore_scan.wait_for_verdict("https://x.example", KEY, "abc123", "critical", "new", 1200, 10, sleep=lambda s: None)

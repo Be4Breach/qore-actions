@@ -28,10 +28,16 @@ DEFAULT_API_URL = "https://api.be4breach.com"
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 USER_AGENT = "qore-scan-ci/1"
 MAX_BACKOFF_SECONDS = 60
+#: while waiting for a result, give up only after this long without any answer from the API
+MAX_SILENCE_SECONDS = 300
 
 
 class QoreError(Exception):
     """Something that makes the run an error (exit 2), with a message safe to print."""
+
+
+class NetworkError(QoreError):
+    """The API could not be reached (timeout, refused connection, DNS). Transient while waiting for a result."""
 
 
 def normalize_api_url(url: str) -> str:
@@ -64,7 +70,7 @@ def _request(method: str, url: str, key: str, body=None, timeout: int = 30):
             payload = {}
         return exc.code, payload, exc.headers
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise QoreError("Could not reach the QORE API: %s" % type(exc).__name__)
+        raise NetworkError("Could not reach the QORE API: %s" % type(exc).__name__)
 
 
 def _detail(payload) -> str:
@@ -91,12 +97,29 @@ def start_scan(api_url, key, repo):
     raise QoreError("The QORE API could not start the scan (HTTP %s): %s" % (code, _detail(payload)))
 
 
-def wait_for_verdict(api_url, key, scan_id, fail_on, mode, timeout_s, poll_s, sleep=time.sleep, clock=time.monotonic):
+def wait_for_verdict(api_url, key, scan_id, fail_on, mode, timeout_s, poll_s, sleep=time.sleep, clock=time.monotonic,
+                     max_silence_s=MAX_SILENCE_SECONDS):
+    """Poll until the scan is done. Reading a result is safe to repeat, so a network hiccup (timeout, dropped
+    connection) is retried with backoff instead of failing the build: the scan keeps running on the server.
+    Only a long unbroken silence (``max_silence_s``) or the overall timeout ends the wait."""
     url = "%s/api/ci/v1/scans/%s?%s" % (api_url, urllib.parse.quote(scan_id, safe=""), urllib.parse.urlencode({"fail_on": fail_on, "mode": mode}))
     deadline = clock() + timeout_s
     backoff = poll_s
+    last_contact = clock()
     while True:
-        code, payload, headers = _request("GET", url, key)
+        try:
+            code, payload, headers = _request("GET", url, key)
+        except NetworkError as exc:
+            if clock() - last_contact > max_silence_s:
+                raise QoreError("Lost contact with the QORE API for %d minutes (%s). The scan keeps running; see the QORE portal."
+                                % (max_silence_s // 60, str(exc)))
+            backoff = min(MAX_BACKOFF_SECONDS, max(poll_s, backoff * 2))
+            if clock() + backoff >= deadline:
+                raise QoreError("Timed out waiting for the scan (it keeps running; see the QORE portal).")
+            print("QORE: %s; retrying in %ss" % (exc, backoff), file=sys.stderr, flush=True)
+            sleep(backoff)
+            continue
+        last_contact = clock()
         if code == 200:
             backoff = poll_s
             if payload.get("done"):
